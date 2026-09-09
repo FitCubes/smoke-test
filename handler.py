@@ -25,9 +25,61 @@ instance's private IP — it only needs ssm:SendCommand / GetCommandInvocation,
 and the instance only needs the SSM agent (already required for
 AmazonSSMManagedInstanceCore).
 
+Required IAM permissions (execution role, see modules/compute/smoke-test.tf)
+------------------------------------------------------------------------------
+Trust policy:
+    sts:AssumeRole                          principal: lambda.amazonaws.com
+
+Managed policy attachment:
+    arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        -> logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents
+           (writes this function's own CloudWatch log group)
+
+Inline policy statements:
+    AllowRevertSSMDocker
+        ssm:GetParameter, ssm:GetParameters, ssm:PutParameter
+        resource: aws_ssm_parameter.docker_sha.arn
+        -> read/rewrite the docker_sha parameter (and its previous version,
+           read via "<name>:<version>") when the smoke test fails
+
+    AllowLifecycleActions
+        autoscaling:CompleteLifecycleAction
+        autoscaling:RecordLifecycleActionHeartbeat
+        resource: "*"
+        -> resolve/heartbeat/complete the ASG launch lifecycle hook
+
+    AllowSendRunCommand
+        ssm:SendCommand
+        resources:
+            arn:aws:ec2:<region>:<account_id>:instance/*
+            arn:aws:ssm:<region>::document/AWS-RunShellScript
+        -> deliver the curl script to the new instance
+
+    AllowReadRunCommandResult
+        ssm:GetCommandInvocation
+        resource: "*"   (this action does not support resource-level scoping)
+        -> poll the RunCommand invocation for its status/stdout
+
+    Optional, only if CANCEL_INSTANCE_REFRESH=true:
+        autoscaling:DescribeInstanceRefreshes
+        autoscaling:CancelInstanceRefresh
+        resource: "*"
+
+Resource-based policy (on the function itself, not the role):
+    lambda:InvokeFunction                   principal: events.amazonaws.com
+        -> lets the EventBridge rule (aws_cloudwatch_event_rule.asg_hook)
+           invoke this function
+
+Not an IAM permission of the Lambda, but a hard prerequisite on the target
+side: the EC2 instance's own instance profile must carry
+arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore so its SSM Agent is
+registered and reachable by SendCommand/GetCommandInvocation.
+
 Runtime: python3.12, no external packages (boto3 + stdlib only).
 """
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -86,13 +138,18 @@ CANCEL_INSTANCE_REFRESH = os.environ.get("CANCEL_INSTANCE_REFRESH", "false").low
 # SSM RunCommand transport
 # ---------------------------------------------------------------------------
 _STATUS_RE = re.compile(r"SMOKE_HTTP_CODE=(\d+)")
-_BODY_RE = re.compile(r"SMOKE_BODY_START\n(.*)\nSMOKE_BODY_END", re.DOTALL)
+# Body travels as base64 on its own line(s) — deliberately NOT text between
+# newline-anchored markers. curl writes the response body with no trailing
+# newline, so a plain "cat file; echo END_MARKER" merges the last line of the
+# body with the marker (e.g. "...}SMOKE_BODY_END") and a "\n"-anchored regex
+# never matches, leaving the body empty. Base64 sidesteps that entirely.
+_BODY_RE = re.compile(r"SMOKE_BODY_BASE64_START\n(.*?)\nSMOKE_BODY_BASE64_END", re.DOTALL)
 
 
 def _build_curl_script(method, path, body):
     """Build a shell script that curls the app on localhost and prints the
-    status code + response body wrapped in markers we can parse back out of
-    SSM's StandardOutputContent."""
+    status code + base64-encoded response body wrapped in markers we can
+    parse back out of SSM's StandardOutputContent."""
     url = f"http://127.0.0.1:{APP_PORT}{path}"
     lines = ["set +e"]
     data_arg = ""
@@ -105,9 +162,10 @@ def _build_curl_script(method, path, body):
     )
     lines.append('[ -z "$CODE" ] && CODE=000')
     lines.append('echo "SMOKE_HTTP_CODE=$CODE"')
-    lines.append("echo SMOKE_BODY_START")
-    lines.append("cat /tmp/smoke_out.$$ 2>/dev/null")
-    lines.append("echo SMOKE_BODY_END")
+    lines.append("echo SMOKE_BODY_BASE64_START")
+    lines.append("base64 -w0 /tmp/smoke_out.$$ 2>/dev/null")
+    lines.append("echo")  # force a newline after the (unterminated) base64 blob
+    lines.append("echo SMOKE_BODY_BASE64_END")
     lines.append("rm -f /tmp/smoke_out.$$ /tmp/smoke_body.$$ 2>/dev/null")
     return "\n".join(lines)
 
@@ -177,7 +235,14 @@ def curl_via_ssm(instance_id, method, path, body, deadline):
         raise RuntimeError("curl on instance failed to connect (000)")
 
     body_match = _BODY_RE.search(stdout)
-    text = body_match.group(1) if body_match else ""
+    if body_match:
+        b64 = body_match.group(1).replace("\n", "").strip()
+        try:
+            text = base64.b64decode(b64).decode("utf-8", "replace") if b64 else ""
+        except (binascii.Error, ValueError):
+            text = ""
+    else:
+        text = ""
     return status, text
 
 
